@@ -2,145 +2,92 @@
 
 ## Purpose
 
-This guide describes how a platform integrator configures and integrates the
-Caliptra MCU certificate store.
+This guide walks platform integrators through configuring, initializing, and
+connecting the Caliptra MCU certificate store (`caliptra-mcu-cert-store`).
 
-Before integrating the store, review:
+For background and protocol specifications, see:
 
-- [Caliptra Certificate Model](./certificate_model.md) for the trust model,
-  endorsement roles, certificate algorithms, and chain composition.
-- [Caliptra MCU Certificate Store](./cert_store.md) for certificate-store design
-  and behavioral requirements.
-- [In-field Certificate Provisioning and Management](./certificate_provisioning.md)
-  for Owner and Tenant endorsement lifecycles.
-- [External Mailbox Commands](./external_mailbox_cmds.md) for MCI mailbox command
-  definitions.
+- [Caliptra Certificate Model](./certificate_model.md) — trust model, roles, algorithms, and chain layout.
+- [Caliptra MCU Certificate Store](./cert_store.md) — architecture and design guarantees.
+- [In-field Certificate Provisioning and Management](./certificate_provisioning.md) — Owner and Tenant provisioning flows.
+- [External Mailbox Commands](./external_mailbox_cmds.md) — MCI certificate command payloads.
 
-## Integration sequence
+## Integration steps
 
-Integrate the certificate store through the following steps:
+1. [Step 1: Define the platform profile](#step-1-define-the-platform-profile)
+2. [Step 2: Provide Vendor certificates](#step-2-provide-vendor-certificates)
+3. [Step 3: Configure managed endorsement storage](#step-3-configure-managed-endorsement-storage)
+4. [Step 4: Initialize the store at startup](#step-4-initialize-the-store-at-startup)
+5. [Step 5: Connect transports and authorization](#step-5-connect-transports-and-authorization)
+6. [Step 6: Validate the integration](#step-6-validate-the-integration)
 
-1. [Define the platform profile](#define-the-platform-profile) (algorithms, slots, PKI anchor points, and managed storage).
-2. [Provide Vendor certificates](#provide-vendor-certificates) (Root CA and IDevID certificates).
-3. [Configure transport exposure](#configure-transport-exposure) (SPDM and MCI).
-4. [Configure authorization](#configure-authorization).
-5. [Initialize the certificate store](#initialize-the-certificate-store) before starting responders.
-6. [Validate the integration](#validate-the-integration).
+---
 
-## Define the platform profile
+## Step 1: Define the platform profile
 
-The platform profile defines static configuration for the lifetime of the
-certificate store:
+Choose the static configuration for your platform before building the runtime:
 
-| Configuration | Platform selection | Behavior |
+| Setting | Options | Notes |
 | --- | --- | --- |
-| Algorithm profile | ECC P-384 only, or ECC P-384 plus ML-DSA-87 | ECC P-384 is always enabled; ML-DSA-87 is enabled when post-quantum support is configured. |
-| Slot enablement | Enablement of Owner and Tenant slots | Vendor is always enabled and read-only. Owner and Tenant are optional managed slots. |
-| PKI anchor points | Caliptra identity key certified by endorsements | Vendor binds to IDevID. Owner and Tenant can each be configured with a fixed key anchor point or left without a fixed key anchor point (in the default configuration, Owner uses LDevID and Tenant has no fixed key anchor point). |
-| Endorsement backing | Storage allocation and size limits per managed role | Independent backing and size limits for each algorithm in Owner and Tenant. |
+| **Algorithms** | `ECC P-384` (mandatory)<br>`ML-DSA-87` (optional PQC) | When `ML-DSA-87` is enabled, each active slot maintains independent ECC P-384 and ML-DSA-87 chains. |
+| **Slots** | `Vendor` (mandatory, read-only)<br>`Owner` (optional, managed)<br>`Tenant` (optional, managed) | `Vendor` is provisioned at manufacturing. `Owner` and `Tenant` can be updated in the field. |
+| **PKI anchor point** | Fixed (`LDevID = 1`) or unpinned (`None`) | `Vendor` always anchors at `IDevID (0)`. By default, `Owner` pins `LDevID (1)` and `Tenant` is unpinned (caller must specify a supported nonzero key ID). |
+| **Storage backend `B`** | `ManagedEndorsementBackend` implementation (defaults to `NoManagedEndorsement` when only `Vendor` is enabled) | Statically monomorphized via `SharedCertStore<B>`, `TaskCertStore<B>`, and `McuSpdmPal<M, B>`. |
 
-### Select the certificate algorithm profile
+> **Integrator responsibility**: The SDK enforces slot mutability, key-anchor policy, and storage capacity, but does **not** parse X.509 extensions or verify requester permissions. Integrators must validate certificate contents/extensions and enforce requester authorization.
 
-- **ECC P-384**: Mandatory and enabled for all active slots.
-- **ML-DSA-87**: Configured when post-quantum support is required. When enabled,
-  each active slot supports both ECC P-384 and ML-DSA-87 chains independently.
+---
 
-### Select PKI anchor points
+## Step 2: Provide Vendor certificates
 
-The platform configures the static provisioning policy in the certificate store
-for each managed role (Owner and Tenant):
+The `Vendor` slot is read-only for the lifetime of the device:
 
-- **Fixed key anchor point** (for example, Owner is configured with LDevID in
-  the default policy): pins the role to that identity key. `key_pair_id = 0`
-  resolves to the configured key anchor point, and any nonzero `key_pair_id`
-  must match it.
-- **No fixed key anchor point** (for example, Tenant in the default policy):
-  allows any supported key anchor point when a nonzero `key_pair_id` is
-  provided; `key_pair_id = 0` is rejected.
+1. **Embed Vendor CA certificates**: Compile the Vendor Root CA (and any intermediate CA) DER bytes into the user application.
+2. **Supply IDevID certificates at boot**: Retrieve the manufacturing-signed IDevID DER certificate for each enabled algorithm (from OTP or platform storage) and import it into Caliptra during startup.
+3. Do not allocate writable storage for the `Vendor` slot.
 
-SPDM `SET_CERTIFICATE` passes `key_pair_id = 0` when the request has no
-`KeyPairID` field (SPDM 1.2, or SPDM 1.3+ with `MULTI_KEY_CONN_RSP = 0`) and
-passes the request's `KeyPairID` when `MULTI_KEY_CONN_RSP = 1`. MCI mailbox commands must always provide a nonzero `key_pair_id`.
+---
 
-Currently only LDevID (`key_pair_id = 1`) is a supported managed key anchor
-point; FMC Alias (`2`) and RT Alias (`3`) are rejected as unsupported.
+## Step 3: Configure managed endorsement storage
 
-Integrators are responsible for validating certificate contents, required
-extensions, and public-key binding to the selected key anchor point.
+*(Skip this step if only the read-only `Vendor` slot is enabled; `SharedCertStore::new()` defaults to `NoManagedEndorsement` with zero storage overhead.)*
 
-### Allocate managed endorsement storage
+When `Owner` or `Tenant` slots are enabled, allocate disjoint persistent storage for each `(role, algorithm)` pair and provide a `ManagedEndorsementBackend` implementation (`caliptra_mcu_cert_store::endorsement`):
 
-For each enabled managed slot (Owner and Tenant), the platform must allocate
-persistent storage (such as dedicated flash partitions) and configure size limits:
+- **`ManagedEndorsementBackend`** (`Copy + 'static`): Manages one `(role, algorithm)` endorsement store — metadata queries, `read_snapshot()`, single-shot/streamed updates, and durable erasure.
+- **`ManagedReadHandle`** (`Copy + 'static`): Lightweight coordinates returned by `read_snapshot()` so async reads (`read(offset, buf)`) do not borrow `SharedCertStore` across `.await` points while active readers are tracked on `active_region()`.
 
-- **Algorithm independence**: ECC P-384 and ML-DSA-87 must use disjoint,
-  non-overlapping storage regions.
-- **Role independence**: Owner and Tenant must use disjoint storage regions.
-- **Sizing**: Allocate sufficient space for the configured maximum endorsement
-  size plus storage metadata and double-buffering.
-- **Persistence guarantees**: Storage must ensure atomic commits, power-loss
-  safety, and durable removal.
+For Tock `SpiFlash` partitions, integrators can reuse the reference A/B double-buffered implementation (`SingleManagedEndorsement` in `platforms/emulator/runtime/userspace/apps/user/src/cert_store/flash_endorsement.rs`), which writes updates to a `staging_region` while keeping the `active_region` readable and clears `staging_region` before `active_region` on erase. For other media (NAND, EEPROM, KV store, or host storage), implement the two traits directly.
 
-## Provide Vendor certificates
+---
 
-The Vendor slot is established during manufacturing and is strictly read-only:
+## Step 4: Initialize the store at startup
 
-- **Root and Intermediate CAs**: Embed the Vendor CA certificates in the
-  application image.
-- **IDevID certificates**: Supply the manufacturing-signed IDevID certificates
-  for each enabled algorithm (e.g., from OTP or secure platform storage).
-- Do not allocate writable persistent backing for the Vendor slot.
+Call `cert_store::init(...)` once before starting any responder tasks:
 
-## Configure transport exposure
+1. **Initialize Vendor**: Import IDevID certificates into Caliptra and register the static Vendor endorsement chains. Halt startup if the mandatory Vendor ECC P-384 chain fails.
+2. **Recover managed slots**: For each enabled `(role, algorithm)` backend, load persisted state, validate it against the role's key-anchor policy, and register it via `SHARED_CERT_STORE.install_managed_backend(role, backend)`.
+3. **Create per-task handles**: Construct a `TaskCertStore<B>` (`TaskCertStore::new(&SHARED_CERT_STORE)`) for each responder task so task-local caches remain isolated while sharing the global endorsement state.
 
-All enabled transports share the single initialized `CertStore` instance:
+---
 
-- **SPDM**: Uses `SpdmPalCertStore` to map negotiated algorithms and SlotIDs
-  (default: Slot 0 Vendor, Slot 2 Owner, Slot 3 Tenant), advertising only
-  available provisioned chains.
-- **MCI mailbox**: Queries the store directly by algorithm and endorsement role
-  (`Vendor`, `Owner`, `Tenant`). Command formats are defined in [External
-  Mailbox Commands](./external_mailbox_cmds.md).
+## Step 5: Connect transports and authorization
 
-## Configure authorization
+All transports must wrap the same `&'static SharedCertStore<B>` so updates on one transport are immediately visible on all others:
 
-Vendor endorsements are read-only and cannot be modified.
+- **SPDM responder**: Pass `TaskCertStore<B>` into `McuSpdmPal<M, B>` (`SpdmPalCertStore`). Maps SPDM SlotIDs (`0` = Vendor, `2` = Owner, `3` = Tenant) and negotiated algorithms to the shared store.
+- **MCI mailbox responder**: Use a dedicated `TaskCertStore<B>` to service MCI certificate commands by `(EndorsementRole, CertificateAlgorithm)`.
+- **Authorization gate**: Before invoking any write or erase method on `TaskCertStore<B>`, verify the requester's identity and permission to modify the target `(role, algorithm)` slot.
 
-For Owner and Tenant endorsements, platforms must enforce authorization before
-passing updates to the certificate store:
+---
 
-- Validate requester identity and credentials.
-- Verify permissions for the targeted slot, algorithm, and operation (write or erase).
-- Ensure authorization requirements are consistent across all access transports.
+## Step 6: Validate the integration
 
-## Initialize the certificate store
+Verify the following on target hardware or emulation:
 
-The application calls `cert_store::init(...)` once during startup:
-
-1. Imports Vendor IDevID certificates and configures the Vendor slot.
-2. Recovers persisted Owner and Tenant endorsements that match the provisioning policy.
-3. Computes available certificate chains.
-4. Shares the initialized store across SPDM and MCI responders.
-
-Responder tasks (SPDM MCTP, SPDM DOE, MCI mailbox) must start only after
-`cert_store::init(...)` succeeds. If initialization of the mandatory Vendor ECC
-P-384 chain fails, startup must halt.
-
-## Validate the integration
-
-Verify the integrated certificate store:
-
-1. **Chain retrieval**: Retrieve complete chains across all enabled transports
-   (SPDM, MCI) and verify they match expectations from Root CA to DPE leaf.
-2. **Attestation**: Verify attestation challenges against the retrieved leaf
-   certificate.
-3. **Availability**: Confirm that unprovisioned or failed chains are not
-   advertised.
-4. **Independent updates**: Verify that updating an Owner endorsement does not
-   affect ML-DSA or Tenant chains.
-5. **Atomic updates**: Verify that a failed or interrupted update leaves the
-   previous valid endorsement intact.
-6. **Cross-transport consistency**: Confirm that an update made via one transport
-   is immediately visible on all other transports.
-7. **Authorization enforcement**: Verify that unauthorized update attempts
-   and writes to the Vendor slot are rejected without altering stored state.
+- [ ] **Chain retrieval**: Retrieve complete chains across all enabled transports (SPDM, MCI) from Root CA to DPE leaf for all provisioned slots.
+- [ ] **Attestation binding**: Attestation signatures verify against the retrieved leaf certificate.
+- [ ] **Slot & algorithm isolation**: Updating or erasing `Owner` ECC P-384 does not affect `Owner` ML-DSA-87 or `Tenant` slots.
+- [ ] **Atomic updates & power-loss safety**: Aborting a multi-chunk stream or resetting mid-update preserves the previous active endorsement.
+- [ ] **Cross-transport visibility**: An endorsement update on one transport is immediately visible on all other transports.
+- [ ] **Policy & authorization**: Writes to `Vendor` (`role = 0`) and unauthorized writes to `Owner`/`Tenant` are rejected without altering state.

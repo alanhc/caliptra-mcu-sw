@@ -18,6 +18,8 @@
 //! read here and prepended to their respective Caliptra cert chains via the
 //! `POPULATE_IDEV_*_CERT` mailbox commands.
 
+#[cfg(any(test, feature = "test-mctp-spdm-set-certificate"))]
+pub(crate) mod flash_endorsement;
 mod slot0_endorsements;
 
 #[cfg(feature = "test-mctp-spdm-set-certificate")]
@@ -61,7 +63,13 @@ pub(crate) const BOOT_SCRATCH_SIZE: usize =
 
 const PROVISIONING_POLICY: CertificateProvisioningPolicy = CertificateProvisioningPolicy::DEFAULT;
 
-static CERT_STORE: SharedCertStore = SharedCertStore::with_policy(PROVISIONING_POLICY);
+#[cfg(feature = "test-mctp-spdm-set-certificate")]
+pub(crate) type CertStoreBackend = flash_endorsement::SingleManagedEndorsement;
+#[cfg(not(feature = "test-mctp-spdm-set-certificate"))]
+pub(crate) type CertStoreBackend = caliptra_mcu_cert_store::endorsement::NoManagedEndorsement;
+
+static CERT_STORE: SharedCertStore<CertStoreBackend> =
+    SharedCertStore::with_policy(PROVISIONING_POLICY);
 
 /// Each managed `(role, algorithm)` gets its own flash region so that
 /// installing one algorithm's chain cannot erase the other's.
@@ -79,7 +87,9 @@ const MANAGED_ENDORSEMENT_REGIONS: &[(EndorsementRole, CertificateAlgorithm)] = 
 #[cfg(feature = "test-mctp-spdm-set-certificate")]
 const MANAGED_SLOT_REGION_SIZE: usize = {
     assert!(!MANAGED_ENDORSEMENT_REGIONS.is_empty());
-    assert!(CERT_STORE_PARTITION.size % MANAGED_ENDORSEMENT_REGIONS.len() == 0);
+    assert!(CERT_STORE_PARTITION
+        .size
+        .is_multiple_of(MANAGED_ENDORSEMENT_REGIONS.len()));
     CERT_STORE_PARTITION.size / MANAGED_ENDORSEMENT_REGIONS.len()
 };
 
@@ -94,7 +104,7 @@ pub(crate) async fn init(scratch: &BitmapAllocator) -> McuResult<()> {
     Ok(())
 }
 
-pub(crate) fn shared() -> &'static SharedCertStore {
+pub(crate) fn shared() -> &'static SharedCertStore<CertStoreBackend> {
     &CERT_STORE
 }
 
@@ -122,7 +132,10 @@ async fn populate_idev<A: ScratchAlloc>(alloc: &A) -> McuResult<()> {
 /// Called once during boot initialization before spawning responders. Slot 0
 /// failure is fatal. Slots 1-2 stay unprovisioned if flash is empty (they'll be
 /// provisioned via SET_CERTIFICATE).
-async fn setup_endorsements<A: ScratchAlloc>(store: &SharedCertStore, alloc: &A) -> McuResult<()> {
+async fn setup_endorsements<A: ScratchAlloc>(
+    store: &SharedCertStore<CertStoreBackend>,
+    alloc: &A,
+) -> McuResult<()> {
     // Vendor: ReadOnly endorsement with static Root CA (ECC & ML-DSA).
     store
         .set_endorsement_chains(
@@ -141,15 +154,37 @@ async fn setup_endorsements<A: ScratchAlloc>(store: &SharedCertStore, alloc: &A)
     #[cfg(feature = "test-mctp-spdm-set-certificate")]
     {
         for (region_index, &(role, algo)) in MANAGED_ENDORSEMENT_REGIONS.iter().enumerate() {
-            store
-                .set_managed_endorsement(
-                    role,
-                    algo,
-                    CERT_STORE_PARTITION.driver_num,
-                    region_index * MANAGED_SLOT_REGION_SIZE,
-                    MANAGED_SLOT_REGION_SIZE,
-                )
-                .await?;
+            let base = region_index * MANAGED_SLOT_REGION_SIZE;
+            let mut region = flash_endorsement::SingleManagedEndorsement::new(
+                role.record_tag(),
+                algo,
+                CERT_STORE_PARTITION.driver_num,
+                base,
+                MANAGED_SLOT_REGION_SIZE,
+                store.policy().anchor_point(role),
+            );
+            for slot in store.cert_slots() {
+                if let caliptra_mcu_cert_store::endorsement::SlotEndorsement::Managed(managed) =
+                    &slot.endorsement
+                {
+                    for existing in [
+                        managed.get_endorsement(CertificateAlgorithm::EccP384),
+                        managed.get_endorsement(CertificateAlgorithm::MlDsa87),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if existing.region_overlaps(
+                            CERT_STORE_PARTITION.driver_num,
+                            &region.region_range(),
+                        ) {
+                            return Err(mcu_error::codes::INVARIANT);
+                        }
+                    }
+                }
+            }
+            region.load().await?;
+            store.install_managed_backend(role, region)?;
         }
     }
 

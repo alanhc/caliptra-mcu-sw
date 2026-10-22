@@ -4,6 +4,7 @@
 //! Requester authorization and endorsement-content validation are separate.
 
 #![no_std]
+#![allow(async_fn_in_trait)]
 
 pub mod endorsement;
 pub mod store;

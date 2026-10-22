@@ -9,12 +9,15 @@
 
 use super::measurements::MeasurementProvider;
 use super::*;
+use caliptra_mcu_cert_store::endorsement::ManagedEndorsementBackend;
 use caliptra_mcu_spdm_traits::{SpdmPalHash, SpdmPalHashAlgo, SpdmPalIo};
 use mcu_caliptra_api::{
     sha_finish, sha_init, sha_update, HashAlgo, HashState, ScratchAllocProvider, SHA_CONTEXT_SIZE,
 };
 
-impl<M: MeasurementProvider> ScratchAllocProvider for McuSpdmPal<M> {
+impl<M: MeasurementProvider, B: ManagedEndorsementBackend> ScratchAllocProvider
+    for McuSpdmPal<M, B>
+{
     type Alloc = BitmapAllocator;
 
     #[inline]
@@ -23,7 +26,7 @@ impl<M: MeasurementProvider> ScratchAllocProvider for McuSpdmPal<M> {
     }
 }
 
-impl<M: MeasurementProvider> SpdmPalHash for McuSpdmPal<M> {
+impl<M: MeasurementProvider, B: ManagedEndorsementBackend> SpdmPalHash for McuSpdmPal<M, B> {
     type State = HashState<BitmapBytes<'static>>;
 
     #[inline]

@@ -34,6 +34,7 @@
 
 use super::measurements::MeasurementProvider;
 use super::*;
+use caliptra_mcu_cert_store::endorsement::ManagedEndorsementBackend;
 
 /// Per-IO handle returned by [`McuSpdmPal::recv_request`].
 ///
@@ -81,7 +82,7 @@ impl SpdmPalIo for McuSpdmIo<'_> {
     }
 }
 
-impl<M: MeasurementProvider> SpdmPalIoTransport for McuSpdmPal<M> {
+impl<M: MeasurementProvider, B: ManagedEndorsementBackend> SpdmPalIoTransport for McuSpdmPal<M, B> {
     type Io<'a>
         = McuSpdmIo<'a>
     where
