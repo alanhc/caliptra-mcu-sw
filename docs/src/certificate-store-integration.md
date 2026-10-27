@@ -76,7 +76,7 @@ Call `cert_store::init(...)` once before starting any responder tasks:
 All transports must wrap the same `&'static SharedCertStore<B>` so updates on one transport are immediately visible on all others:
 
 - **SPDM responder**: Pass `TaskCertStore<B>` into `McuSpdmPal<M, B>` (`SpdmPalCertStore`). Maps SPDM SlotIDs (`0` = Vendor, `2` = Owner, `3` = Tenant) and negotiated algorithms to the shared store.
-- **MCI mailbox responder**: Use a dedicated `TaskCertStore<B>` to service MCI certificate commands by `(EndorsementRole, CertificateAlgorithm)`.
+- **MCI mailbox responder**: Use a dedicated `TaskCertStore<B>` to service `MC_GET_CERT_CHAIN_INFO`, `MC_GET_CERT_CHAIN`, and `MC_SET_CERT_CHAIN` by `(EndorsementRole, CertificateAlgorithm)`.
 - **Authorization gate**: Before invoking any write or erase method on `TaskCertStore<B>`, verify the requester's identity and permission to modify the target `(role, algorithm)` slot.
 
 ---
@@ -85,9 +85,9 @@ All transports must wrap the same `&'static SharedCertStore<B>` so updates on on
 
 Verify the following on target hardware or emulation:
 
-- [ ] **Chain retrieval**: Retrieve complete chains across all enabled transports (SPDM, MCI) from Root CA to DPE leaf for all provisioned slots.
-- [ ] **Attestation binding**: Attestation signatures verify against the retrieved leaf certificate.
+- [ ] **Chain retrieval**: `GET_CERTIFICATE` (SPDM) and `MC_GET_CERT_CHAIN` (MCI) return complete chains from Root CA to DPE leaf for all provisioned slots.
+- [ ] **Attestation binding**: SPDM `CHALLENGE` and `MC_GET_ATTESTATION` signatures verify against the retrieved leaf certificate.
 - [ ] **Slot & algorithm isolation**: Updating or erasing `Owner` ECC P-384 does not affect `Owner` ML-DSA-87 or `Tenant` slots.
 - [ ] **Atomic updates & power-loss safety**: Aborting a multi-chunk stream or resetting mid-update preserves the previous active endorsement.
-- [ ] **Cross-transport visibility**: An endorsement update on one transport is immediately visible on all other transports.
+- [ ] **Cross-transport visibility**: An endorsement provisioned via SPDM `SET_CERTIFICATE` is immediately reflected in `MC_GET_CERT_CHAIN_INFO` / `MC_GET_CERT_CHAIN` (and vice versa).
 - [ ] **Policy & authorization**: Writes to `Vendor` (`role = 0`) and unauthorized writes to `Owner`/`Tenant` are rejected without altering state.
